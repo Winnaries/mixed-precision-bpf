@@ -35,7 +35,6 @@ long long get_time() {
     gettimeofday(&tv, NULL);
     return (tv.tv_sec * 1000000) +tv.tv_usec;
 }
-// Returns the number of seconds elapsed between the two specified times
 
 double elapsed_time(long long start_time, long long end_time) {
     return (double) (end_time - start_time) / (1000 * 1000);
@@ -51,26 +50,6 @@ void check_error(cudaError e) {
         printf("\nCUDA error: %s\n", cudaGetErrorString(e));
         exit(1);
     }
-}
-
-void cuda_print_double_array(double *array_GPU, size_t size) {
-    //allocate temporary array for printing
-    double* mem = (double*) malloc(sizeof (double) *size);
-
-    //transfer data from device
-    cudaMemcpy(mem, array_GPU, sizeof (double) *size, cudaMemcpyDeviceToHost);
-
-
-    printf("PRINTING ARRAY VALUES\n");
-    //print values in memory
-    for (size_t i = 0; i < size; ++i) {
-        printf("[%d]:%0.6f\n", i, mem[i]);
-    }
-    printf("FINISHED PRINTING ARRAY VALUES\n");
-
-    //clean up memory
-    free(mem);
-    mem = NULL;
 }
 
 /********************************
@@ -154,16 +133,6 @@ double randn(int * seed, int index) {
     return sqrt(rt) * cosine;
 }
 
-double test_randn(int * seed, int index) {
-    //Box-Muller algortihm
-    double pi = 3.14159265358979323846;
-    double u = randu(seed, index);
-    double v = randu(seed, index);
-    double cosine = cos(2 * pi * v);
-    double rt = -2 * log(u);
-    return sqrt(rt) * cosine;
-}
-
 __device__ double d_randn(int * seed, int index) {
     //Box-Muller algortihm
     double pi = 3.14159265358979323846;
@@ -172,49 +141,6 @@ __device__ double d_randn(int * seed, int index) {
     double cosine = cos(2 * pi * v);
     double rt = -2 * log(u);
     return sqrt(rt) * cosine;
-}
-
-/****************************
-UPDATE WEIGHTS
-UPDATES WEIGHTS
-param1 weights
-param2 likelihood
-param3 Nparcitles
- ****************************/
-__device__ double updateWeights(double * weights, double * likelihood, int Nparticles) {
-    int x;
-    double sum = 0;
-    for (x = 0; x < Nparticles; x++) {
-        weights[x] = weights[x] * exp(likelihood[x]);
-        sum += weights[x];
-    }
-    return sum;
-}
-
-__device__ int findIndexBin(double * CDF, int beginIndex, int endIndex, double value) {
-    if (endIndex < beginIndex)
-        return -1;
-    int middleIndex;
-    while (endIndex > beginIndex) {
-        middleIndex = beginIndex + ((endIndex - beginIndex) / 2);
-        if (CDF[middleIndex] >= value) {
-            if (middleIndex == 0)
-                return middleIndex;
-            else if (CDF[middleIndex - 1] < value)
-                return middleIndex;
-            else if (CDF[middleIndex - 1] == value) {
-                while (CDF[middleIndex] == value && middleIndex >= 0)
-                    middleIndex--;
-                middleIndex++;
-                return middleIndex;
-            }
-        }
-        if (CDF[middleIndex] > value)
-            endIndex = middleIndex - 1;
-        else
-            beginIndex = middleIndex + 1;
-    }
-    return -1;
 }
 
 /** added this function. was missing in original double version.
@@ -451,12 +377,15 @@ __global__ void likelihood_kernel(double * arrayX, double * arrayY, double * xj,
         likelihood[i] = calcLikelihoodSum(I, ind, countOnes, i);
         
         likelihood[i] = likelihood[i] / countOnes;
-        
+
         /**
          * Update weights
         */
         weights[i] = weights[i] * exp(likelihood[i]); 
+
+        // printf("%d : ll = %10f, w = %10f\n", k, likelihood[i], weights[i]); 
     }
+
 
     /**
      * Pre-fill buffer with zero. Required 
@@ -716,29 +645,6 @@ void videoSequence(unsigned char * I, int IszX, int IszY, int Nfr, int * seed) {
 }
 
 /**
- * Finds the first element in the CDF that is greater than or equal to the provided value and returns that index
- * @note This function uses sequential search
- * @param CDF The CDF
- * @param lengthCDF The length of CDF
- * @param value The value to be found
- * @return The index of value in the CDF; if value is never found, returns the last index
- */
-int findIndex(double * CDF, int lengthCDF, double value) {
-    int index = -1;
-    int x;
-    for (x = 0; x < lengthCDF; x++) {
-        if (CDF[x] >= value) {
-            index = x;
-            break;
-        }
-    }
-    if (index == -1) {
-        return lengthCDF - 1;
-    }
-    return index;
-}
-
-/**
  * The implementation of the particle filter using OpenMP for many frames
  * @see http://openmp.org/wp/
  * @note This function is designed to work with a video of several frames. In addition, it references a provided MATLAB function which takes the video, the objxy matrix and the x and y arrays as arguments and returns the likelihoods
@@ -855,6 +761,8 @@ void particleFilter(unsigned char * I, int IszX, int IszY, int Nfr, int * seed, 
     printf("TRACING = DISABLED\n");
 #endif
 
+    long long kernelStart = get_time(); 
+
     for (k = 1; k < Nfr; k++) {
         
         likelihood_kernel << < num_blocks, threads_per_block >> > (arrayX_GPU, arrayY_GPU, xj_GPU, yj_GPU, CDF_GPU, ind_GPU, objxy_GPU, likelihood_GPU, I_GPU, weights_GPU, Nparticles, countOnes, max_size, k, IszY, Nfr, seed_GPU, partial_sums);
@@ -885,6 +793,8 @@ void particleFilter(unsigned char * I, int IszX, int IszY, int Nfr, int * seed, 
 #endif 
 
     }//end loop
+
+    long long kernelEnd = get_time(); 
 
 #ifdef TRACE_WEIGHT
     fprintf(pfp, "end\n"); 
