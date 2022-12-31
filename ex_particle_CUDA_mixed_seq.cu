@@ -312,7 +312,7 @@ void videoSequence(unsigned char *I, int IszX, int IszY, int Nfr, int *seed)
     int y0 = (int)roundDouble(IszX / 2.0);
     I[x0 * IszY * Nfr + y0 * Nfr + 0] = 1;
 
-    FILE *fp = fopen("true_path.txt", "w");
+    FILE *fp = fopen("movement_true.txt", "w");
     fprintf(fp, "TRUE MOVEMENT: \n");
 
     /*move point*/
@@ -452,7 +452,6 @@ __global__ void likelihoodKernel(T *X, T *Y, int nParticles, int *objXy, int cou
         }
 
         likelihood[idx] = localLL;
-        // printf("%d -> %f\n", frIdx, likelihood[idx]);
     }
 }
 
@@ -476,7 +475,7 @@ __global__ void weightingKernel(T *likelihood, T *weights, T *cdf, double *sum, 
     extern __shared__ double buffer[]; 
 
     if (globalIdx < nParticles) {
-        unnormalized = (double)weights[globalIdx] * Gexp((double)likelihood[globalIdx] + 100.0);
+        unnormalized = (double)weights[globalIdx] * exp((double)likelihood[globalIdx] + 100);
         buffer[localIdx] = unnormalized; 
     }
 
@@ -487,6 +486,12 @@ __global__ void weightingKernel(T *likelihood, T *weights, T *cdf, double *sum, 
             buffer[localIdx] += buffer[localIdx + s]; 
         __syncthreads();
     }
+
+    if (globalIdx == 0) {
+        *sum = 0; 
+    }
+
+    __syncthreads(); 
 
     if (localIdx == 0) {
         atomicAdd(sum, buffer[0]); 
@@ -503,7 +508,8 @@ __global__ void weightingKernel(T *likelihood, T *weights, T *cdf, double *sum, 
             cdf[x] = weights[x] + cdf[x - 1]; 
         }
     }
-        
+    
+    __syncthreads(); 
 }
 
 /**
@@ -688,6 +694,8 @@ void particleFilter(unsigned char *I, int IszX, int IszY, int Nfr, int *seed, in
 
 #ifdef TRACE
     FILE *fp = fopen("mixed_precision_trace.txt", "w"); 
+    FILE *pfp = fopen("movement_hat.txt", "w"); 
+    fprintf(pfp, "PREDICTED MOVEMENT:\n");
 #endif
 
     
@@ -707,14 +715,14 @@ void particleFilter(unsigned char *I, int IszX, int IszY, int Nfr, int *seed, in
         cudaCheck(cudaMemcpy(Y, deviceY, nParticles * sizeof(T), cudaMemcpyDeviceToHost));
         cudaCheck(cudaMemcpy(U, deviceU, nParticles * sizeof(T), cudaMemcpyDeviceToHost));
 
-        // fprintf(fp, "\nFRAME %d\n", r); 
-        // for (k = 0; k < nParticles; k++)
-        // {
-        //     fprintf(fp, "<%5.2f, %5.2f> || <%5.2f, %5.2f> ~ %10.4f ~ %10.4f ^+ %10.4f ~ %10.4f \n",
-        //             (double)Ax[k], (double)Ay[k], (double) X[k], (double)Y[k], 
-        //             (double)likelihood[k], (double)weights[k], 
-        //             (double)cdf[k], (double)U[k]);
-        // }
+        fprintf(fp, "\nFRAME %d\n", r);
+        for (k = 0; k < nParticles; k++)
+        {
+            fprintf(fp, "<%5.2f, %5.2f> || <%5.2f, %5.2f> ~ %10.4f ~ %10.4f ^+ %10.4f ~ %10.4f \n",
+                    (double)Ax[k], (double)Ay[k], (double) X[k], (double)Y[k], 
+                    (double)likelihood[k], (double)weights[k], 
+                    (double)cdf[k], (double)U[k]);
+        }
 
         double xHat = 0.0; 
         double yHat = 0.0; 
@@ -726,13 +734,15 @@ void particleFilter(unsigned char *I, int IszX, int IszY, int Nfr, int *seed, in
 
         fprintf(fp, "END FRAME %d ~ Predicted Position = <%f,%f>\n", 
                 r, xHat, yHat);
+        fprintf(pfp, ". <%.2f, %.2f>\n", xHat, yHat);
 #endif
         resamplingKernel<<<numBlocks, threadsPerBlocks>>>(states, deviceX, deviceY, deviceAx, deviceAy, deviceWeights, deviceCdf, deviceU, nParticles);
-
     }
 
 #ifdef TRACE
+    fprintf(pfp, "end"); 
     fclose(fp);
+    fclose(pfp);
 #endif
 
     cudaDeviceSynchronize();

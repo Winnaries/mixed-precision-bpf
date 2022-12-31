@@ -1,3 +1,4 @@
 particlefilter_*
-*_path.txt
+movement*.txt
+*trace.txt
 *.csv
