@@ -2,3 +2,4 @@ particlefilter_*
 movement*.txt
 *trace.txt
 *.csv
+benchmark/
