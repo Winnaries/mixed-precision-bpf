@@ -687,6 +687,7 @@ __global__ void weightingKernel(half *likelihood, half *weights, half *cdf, half
     int localIdx = threadIdx.x;
 
     half2 unnormalized2;
+    half2 *cdf2 = (half2 *)cdf;
     half2 *weights2 = (half2 *)weights;
     half2 *likelihood2 = (half2 *)likelihood;
     half2 maxLikelihood2 = __half2half2(maxLikelihood[0]);
@@ -733,11 +734,13 @@ __global__ void weightingKernel(half *likelihood, half *weights, half *cdf, half
 
     if (globalIdx == 0)
     {
-        int x;
-        cdf[0] = weights[0];
-        for (x = 1; x < nParticles; x++)
+        half2 temp, prev = __half2half2(0.0); 
+        for (int x = 0; x < nParticles2; x++)
         {
-            cdf[x] = weights[x] + cdf[x - 1];
+            temp = weights2[x]; 
+            temp += __halves2half2(0.0, __low2half(temp)); 
+            cdf2[x] = temp + prev; 
+            prev += __half2half2(__high2half(temp)); 
         }
     }
 
