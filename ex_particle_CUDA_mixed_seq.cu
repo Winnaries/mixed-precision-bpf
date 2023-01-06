@@ -374,9 +374,9 @@ __device__ inline void h2print(half2 x) { printf("(%10.4f, %10.4f)\n", __low2flo
 /**
  * NVIDIA shared memory doesn't support unspecialized
  * function template. Below are the work around. So that
- * we don't have unspecialized initialization. 
- * 
-*/
+ * we don't have unspecialized initialization.
+ *
+ */
 template <typename T>
 struct SharedMemory
 {
@@ -558,12 +558,12 @@ __global__ void likelihoodKernel(half *X, half *Y, int nParticles, int *objXy, i
 }
 
 /**
- * Find the maximum value in the array. 
- * Required for log-sum-exp tricks. 
- * @param array 
+ * Find the maximum value in the array.
+ * Required for log-sum-exp tricks.
+ * @param array
  * @param result
  * @param n
-*/
+ */
 template <typename T>
 __global__ void findMaxKernel(T *array, T *result, int n)
 {
@@ -575,6 +575,10 @@ __global__ void findMaxKernel(T *array, T *result, int n)
     if (globalIdx < n)
     {
         fmbuffer[localIdx] = (double)array[globalIdx];
+    }
+    else
+    {
+        fmbuffer[localIdx] = -100;
     }
 
     __syncthreads();
@@ -591,17 +595,17 @@ __global__ void findMaxKernel(T *array, T *result, int n)
         __syncthreads();
     }
 
-
-    if (localIdx == 0) {
-        result[blockIdx.x] = (T)fmbuffer[0]; 
+    if (localIdx == 0)
+    {
+        result[blockIdx.x] = (T)fmbuffer[0];
     }
 
-    __syncthreads(); 
+    __syncthreads();
 
     if (globalIdx == 0)
     {
         for (int i = 1; i < gridDim.x; i++)
-            result[0] = result[0] > result[i] ? result[0] : result[i]; 
+            result[0] = result[0] > result[i] ? result[0] : result[i];
     }
 
     __syncthreads();
@@ -618,19 +622,23 @@ __global__ void findMaxKernel(T *array, T *result, int n)
  * @param nParticles The number of particles
  */
 template <typename T>
-__global__ void weightingKernel(T *likelihood, T *weights, T *cdf, double *sum, int nParticles, T *maxLikelihood)
+__global__ void weightingKernel(T *likelihood, T *weights, T *cdf, T *sum, int nParticles, T *maxLikelihood)
 {
     int globalIdx = blockIdx.x * blockDim.x + threadIdx.x;
     int localIdx = threadIdx.x;
-    double unnormalized;
+    T unnormalized;
 
-    SharedMemory<double> sharedMem;
-    double* buffer = sharedMem.getPointer();  
+    SharedMemory<T> sharedMem;
+    T *buffer = sharedMem.getPointer();
 
     if (globalIdx < nParticles)
     {
-        unnormalized = (double)weights[globalIdx] * exp((double)likelihood[globalIdx] - (double)(maxLikelihood[0]));
+        unnormalized = weights[globalIdx] * exp(likelihood[globalIdx] - maxLikelihood[0]);
         buffer[localIdx] = unnormalized;
+    }
+    else
+    {
+        buffer[localIdx] = 0.0;
     }
 
     __syncthreads();
@@ -656,7 +664,72 @@ __global__ void weightingKernel(T *likelihood, T *weights, T *cdf, double *sum, 
 
     __syncthreads();
 
-    weights[globalIdx] = (T)(unnormalized / (*sum));
+    weights[globalIdx] = unnormalized / (*sum);
+
+    if (globalIdx == 0)
+    {
+        int x;
+        cdf[0] = weights[0];
+        for (x = 1; x < nParticles; x++)
+        {
+            cdf[x] = weights[x] + cdf[x - 1];
+        }
+    }
+
+    __syncthreads();
+}
+
+template <>
+__global__ void weightingKernel(half *likelihood, half *weights, half *cdf, half *sum, int nParticles, half *maxLikelihood)
+{
+    int nParticles2 = nParticles / 2;
+    int globalIdx = blockIdx.x * blockDim.x + threadIdx.x;
+    int localIdx = threadIdx.x;
+
+    half2 unnormalized2;
+    half2 *weights2 = (half2 *)weights;
+    half2 *likelihood2 = (half2 *)likelihood;
+    half2 maxLikelihood2 = __half2half2(maxLikelihood[0]);
+
+    extern __shared__ half buffer[];
+    half2 *buffer2 = (half2 *)buffer; 
+
+    if (globalIdx < nParticles2)
+    {
+        unnormalized2 = weights2[globalIdx] * h2exp(__hsub2(likelihood2[globalIdx], maxLikelihood2));
+        buffer2[localIdx] = unnormalized2;
+    }
+    else
+    {
+        buffer2[localIdx] = __half2half2(0.0);
+    }
+
+    __syncthreads();
+
+    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1)
+    {
+        if (threadIdx.x < s)
+            buffer2[localIdx] += buffer2[localIdx + s];
+        __syncthreads();
+    }
+
+    if (globalIdx == 0)
+    {
+        *sum = 0;
+    }
+
+    __syncthreads();
+
+    if (localIdx == 0)
+    {
+        atomicAdd(sum, buffer[0] + buffer[1]);
+    }
+
+    __syncthreads();
+
+    if (globalIdx < nParticles2) {
+        weights2[globalIdx] = unnormalized2 / __half2half2(*sum);
+    }
 
     if (globalIdx == 0)
     {
@@ -735,9 +808,14 @@ __global__ void resamplingKernel(curandState *states, T *X, T *Y, T *Ax, T *Ay, 
  * @param tpb the number of threads per block
  */
 template <typename T>
-inline int LLNumBlocks(int n, int m, int tpb) { return (n * m - 1) / tpb + 1; }
+inline int calcNumBlocks(int n, int m, int tpb) { return (n * m - 1) / tpb + 1; }
 template <>
-inline int LLNumBlocks<half>(int n, int m, int tpb) { return (n * m / 2 - 1) / tpb + 1; }
+inline int calcNumBlocks<half>(int n, int m, int tpb) { return (n * m / 2 - 1) / tpb + 1; }
+
+template <typename T>
+inline int calcSharedMem(int tpb) { return tpb * sizeof(T); }
+template <>
+inline int calcSharedMem<half>(int tpb) { return tpb * 2 * sizeof(half); }
 
 /**
  * The implementation of the particle filter using OpenMP for many frames
@@ -815,7 +893,7 @@ void particleFilter(unsigned char *I, int IszX, int IszY, int Nfr, int seed, int
     T *deviceAx, *deviceAy, *deviceX, *deviceY, *deviceU;
     T *deviceLikelihood, *deviceCdf, *deviceWeights;
     T *deviceMaxLikelihood;
-    double *deviceSum;
+    T *deviceSum;
 
     int *deviceObjXy;
     unsigned char *deviceI;
@@ -843,7 +921,7 @@ void particleFilter(unsigned char *I, int IszX, int IszY, int Nfr, int seed, int
     cudaCheck(cudaMalloc(&deviceY, nParticles * sizeof(T)));
     cudaCheck(cudaMalloc(&deviceU, nParticles * sizeof(T)));
 
-    cudaCheck(cudaMalloc(&deviceSum, sizeof(double)));
+    cudaCheck(cudaMalloc(&deviceSum, sizeof(T)));
     cudaCheck(cudaMalloc(&deviceMaxLikelihood, numBlocks * sizeof(T)));
     cudaCheck(cudaMalloc(&deviceCdf, nParticles * sizeof(T)));
     cudaCheck(cudaMalloc(&deviceWeights, nParticles * sizeof(T)));
@@ -877,7 +955,6 @@ void particleFilter(unsigned char *I, int IszX, int IszY, int Nfr, int seed, int
 #endif
 
     long long kernelStart = get_time();
-    int sharedMemSize = threadsPerBlocks * sizeof(double);
     for (r = 0; r < Nfr; r++)
     {
         propagationKernel<<<numBlocks, threadsPerBlocks>>>(states,
@@ -885,19 +962,21 @@ void particleFilter(unsigned char *I, int IszX, int IszY, int Nfr, int seed, int
                                                            deviceAx, deviceAy,
                                                            nParticles);
 
-        int numBlocksTemp = LLNumBlocks<T>(nParticles, countOnes, threadsPerBlocks);
-        likelihoodKernel<<<numBlocksTemp, threadsPerBlocks>>>(deviceX, deviceY,
-                                                              nParticles, deviceObjXy, countOnes,
-                                                              deviceLikelihood, deviceI,
-                                                              IszY, Nfr, maxSize, r);
+        int likelihoodBlocks = calcNumBlocks<T>(nParticles, countOnes, threadsPerBlocks);
+        likelihoodKernel<<<likelihoodBlocks, threadsPerBlocks>>>(deviceX, deviceY,
+                                                                 nParticles, deviceObjXy, countOnes,
+                                                                 deviceLikelihood, deviceI,
+                                                                 IszY, Nfr, maxSize, r);
 
         findMaxKernel<<<numBlocks, threadsPerBlocks, threadsPerBlocks * sizeof(double)>>>(deviceLikelihood,
-                                                                                          deviceMaxLikelihood, nParticles); 
+                                                                                          deviceMaxLikelihood, nParticles);
 
-        weightingKernel<<<numBlocks, threadsPerBlocks, sharedMemSize>>>(deviceLikelihood,
-                                                                        deviceWeights, deviceCdf,
-                                                                        deviceSum, nParticles, 
-                                                                        deviceMaxLikelihood);
+        int weightingBlocks = calcNumBlocks<T>(nParticles, 1, threadsPerBlocks);
+        int weightingSharedMem = calcSharedMem<T>(threadsPerBlocks);
+        weightingKernel<<<weightingBlocks, threadsPerBlocks, weightingSharedMem>>>(deviceLikelihood,
+                                                                                   deviceWeights, deviceCdf,
+                                                                                   deviceSum, nParticles,
+                                                                                   deviceMaxLikelihood);
 
 #ifdef TRACE
         cudaCheck(cudaMemcpy(likelihood, deviceLikelihood, nParticles * sizeof(T), cudaMemcpyDeviceToHost));
