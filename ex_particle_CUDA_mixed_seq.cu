@@ -110,13 +110,13 @@ double randn(int *seed, int index)
     return sqrt(rt) * cosine;
 }
 
-template<typename T>
-__device__ T deviceRound(T value) 
+template <typename T>
+__device__ T deviceRound(T value)
 {
-    int newValue = (int)value; 
-    return value - (T)newValue < ((T)0.5) 
-        ? newValue 
-        : newValue + 1; 
+    int newValue = (int)value;
+    return value - (T)newValue < ((T)0.5)
+               ? newValue
+               : newValue + 1;
 }
 
 /**
@@ -358,7 +358,7 @@ void videoSequence(unsigned char *I, int IszX, int IszY, int Nfr, int *seed)
  * Gsqrt short for generic square root.
  */
 __device__ inline nv_half Gsqrt(nv_half x) { return hsqrt(x); }
-__device__ inline float Gsqrt(float x) { return sqrt(x); }
+__device__ inline float Gsqrt(float x) { return sqrtf(x); }
 __device__ inline double Gsqrt(double x) { return sqrt(x); }
 
 /**
@@ -368,6 +368,56 @@ __device__ inline double Gsqrt(double x) { return sqrt(x); }
 __device__ inline nv_half Gexp(nv_half x) { return hexp(x); }
 __device__ inline float Gexp(float x) { return exp(x); }
 __device__ inline double Gexp(double x) { return exp(x); }
+
+__device__ inline void h2print(half2 x) { printf("(%10.4f, %10.4f)\n", __low2float(x), __high2float(x)); }
+
+/**
+ * NVIDIA shared memory doesn't support unspecialized
+ * function template. Below are the work around. So that
+ * we don't have unspecialized initialization. 
+ * 
+*/
+template <typename T>
+struct SharedMemory
+{
+    // Ensure that we won't compile any un-specialized types
+    __device__ T *getPointer()
+    {
+        extern __device__ void error(void);
+        error();
+        return NULL;
+    }
+};
+
+template <>
+struct SharedMemory<half>
+{
+    __device__ half *getPointer()
+    {
+        extern __shared__ half s_half[];
+        return s_half;
+    }
+};
+
+template <>
+struct SharedMemory<float>
+{
+    __device__ float *getPointer()
+    {
+        extern __shared__ float s_float[];
+        return s_float;
+    }
+};
+
+template <>
+struct SharedMemory<double>
+{
+    __device__ double *getPointer()
+    {
+        extern __shared__ double s_double[];
+        return s_double;
+    }
+};
 
 /**
  * Initialize cuRAND state for random number generation.
@@ -416,7 +466,7 @@ __global__ void propagationKernel(curandState *states, T *X, T *Y, T *Ax, T *Ay,
 /**
  * Evaluate the likelihood of each particles
  * giving the observation at frame T.
- * @param X 
+ * @param X
  * @param Y
  * @param nParticles
  * @param objXy
@@ -430,132 +480,200 @@ __global__ void propagationKernel(curandState *states, T *X, T *Y, T *Ax, T *Ay,
 template <typename T>
 __global__ void likelihoodKernel(T *X, T *Y, int nParticles, int *objXy, int countOnes, T *likelihood, unsigned char *I, int IszY, int Nfr, int maxSize, int frIdx)
 {
-    int k, i, indX, indY, idx = blockDim.x * blockIdx.x + threadIdx.x;
-    T fg, bg; 
+    int i, indX, indY;
 
-    if (idx < nParticles)
+    int idx = blockDim.x * blockIdx.x + threadIdx.x;
+    int particleIdx = idx / countOnes;
+    int pixelIdx = idx % countOnes;
+
+    T fg, bg, local;
+
+    if (pixelIdx == 0)
     {
-        T localLL = 0.0; 
+        likelihood[particleIdx] = 0;
+    }
 
-        for (k = 0; k < countOnes; k++) {
-            /**
-             * BREAKING: In the original version, 
-             * the objXy is y-first, but here I changed it
-            */
-            indX = (int)deviceRound(X[idx]) + objXy[k * 2];
-            indY = (int)deviceRound(Y[idx]) + objXy[k * 2 + 1];
-            i = abs(indY * IszY * Nfr + indX * Nfr + frIdx); 
-            i = i < maxSize ? i : 0;
-            bg = (T)(I[i] - 100) / Gsqrt((T)countOnes * (T)50.0);
-            fg = (T)(I[i] - 228) / Gsqrt((T)countOnes * (T)50.0);
-            localLL += bg * bg - fg * fg;
-        }
+    __syncthreads();
 
-        likelihood[idx] = localLL;
+    if (particleIdx < nParticles)
+    {
+        indX = (int)deviceRound(X[particleIdx]) + objXy[pixelIdx * 2];
+        indY = (int)deviceRound(Y[particleIdx]) + objXy[pixelIdx * 2 + 1];
+        i = abs(indY * IszY * Nfr + indX * Nfr + frIdx);
+        i = i < maxSize ? i : 0;
+        bg = (T)(I[i] - 100) / Gsqrt((T)countOnes * (T)50.0);
+        fg = (T)(I[i] - 228) / Gsqrt((T)countOnes * (T)50.0);
+        local = bg * bg - fg * fg;
+
+        atomicAdd(&likelihood[particleIdx], local);
     }
 }
 
 template <>
 __global__ void likelihoodKernel(half *X, half *Y, int nParticles, int *objXy, int countOnes, half *likelihood, unsigned char *I, int IszY, int Nfr, int maxSize, int frIdx)
 {
-    int k, i, indX, indY, idx = blockDim.x * blockIdx.x + threadIdx.x;
+    int indX1, indY1, indX2, indY2, ind1, ind2;
 
-    half recv;
+    int idx = blockDim.x * blockIdx.x + threadIdx.x;
+    int particleIdx2 = idx / countOnes;
+    int pixelIdx = idx % countOnes;
+    int nParticles2 = nParticles / 2;
+
+    half2 bg, fg, indX, indY;
+    half2 denom = h2rsqrt(__half2half2((half)(countOnes * 50)));
+
     half2 *X2 = (half2 *)X, *Y2 = (half2 *)Y;
     half2 *likelihood2 = (half2 *)likelihood;
-    half2 temp, pref = h2rsqrt(__half2half2(__int2half_rn(countOnes * 50)));
 
-    if (idx < nParticles)
+    if (particleIdx2 < nParticles2 && pixelIdx == 0)
     {
-        half local = 0.0;
-        int x = __half2int_rn(X[idx]);
-        int y = __half2int_rn(Y[idx]);
+        likelihood2[particleIdx2] = __half2half2(0.0);
+    }
 
-        for (k = 0; k < countOnes; k++)
-        {
-            indX = x + objXy[k * 2];
-            indY = y + objXy[k * 2 + 1];
-            i = abs(indY * IszY * Nfr + indX * Nfr + frIdx);
-            i = i < maxSize ? i : 0;
+    __syncthreads();
 
-            temp = __hmul2(__floats2half2_rn(I[i] - 100, I[i] - 228), pref);
-            temp = __hmul2(temp, temp);
-            local += __hsub(__low2half(temp), __high2half(temp));
-        }
+    if (particleIdx2 < nParticles2)
+    {
+        indX = X2[particleIdx2];
+        indY = Y2[particleIdx2];
 
-        recv = __shfl_down_sync(0xffffffff, local, 1, 32);
+        indX1 = __half2int_rn(__low2half(indX)) + objXy[pixelIdx * 2];
+        indY1 = __half2int_rn(__low2half(indY)) + objXy[pixelIdx * 2 + 1];
+        indX2 = __half2int_rn(__high2half(indX)) + objXy[pixelIdx * 2];
+        indY2 = __half2int_rn(__high2half(indY)) + objXy[pixelIdx * 2 + 1];
 
-        if (blockDim.x % 2 && threadIdx.x == blockDim.x - 1)
-        {
-            likelihood[idx] = local;
-        }
-        else if (threadIdx.x % 2 == 0)
-        {
-            likelihood2[idx / 2] = __halves2half2(local, recv);
-        }
+        ind1 = abs(indY1 * IszY * Nfr + indX1 * Nfr + frIdx);
+        ind2 = abs(indY2 * IszY * Nfr + indX2 * Nfr + frIdx);
+        ind1 = ind1 < maxSize ? ind1 : 0;
+        ind2 = ind2 < maxSize ? ind2 : 0;
+
+        bg = __halves2half2(__int2half_rn(I[ind1] - 100), __int2half_rn(I[ind2] - 100)) * denom;
+        fg = __halves2half2(__int2half_rn(I[ind1] - 228), __int2half_rn(I[ind2] - 228)) * denom;
+
+        bg = __hmul2(bg, bg);
+        fg = __hmul2(fg, fg);
+
+        atomicAdd(&likelihood2[particleIdx2], __hsub2(bg, fg));
     }
 }
 
 /**
- * Recalculate particle weights and normalize them. 
- * This function operate on higher-precision type 
- * to preserve numerical stability. 
+ * Find the maximum value in the array. 
+ * Required for log-sum-exp tricks. 
+ * @param array 
+ * @param result
+ * @param n
+*/
+template <typename T>
+__global__ void findMaxKernel(T *array, T *result, int n)
+{
+    int globalIdx = blockIdx.x * blockDim.x + threadIdx.x;
+    int localIdx = threadIdx.x;
+
+    extern __shared__ double fmbuffer[];
+
+    if (globalIdx < n)
+    {
+        fmbuffer[localIdx] = (double)array[globalIdx];
+    }
+
+    __syncthreads();
+
+    for (unsigned int s = blockDim.x / 2; s > 0; s /= 2)
+    {
+        if (localIdx < s)
+        {
+            double a = fmbuffer[localIdx];
+            double b = fmbuffer[localIdx + s];
+            fmbuffer[localIdx] = a > b ? a : b;
+        }
+
+        __syncthreads();
+    }
+
+
+    if (localIdx == 0) {
+        result[blockIdx.x] = (T)fmbuffer[0]; 
+    }
+
+    __syncthreads(); 
+
+    if (globalIdx == 0)
+    {
+        for (int i = 1; i < gridDim.x; i++)
+            result[0] = result[0] > result[i] ? result[0] : result[i]; 
+    }
+
+    __syncthreads();
+}
+
+/**
+ * Recalculate particle weights and normalize them.
+ * This function operate on higher-precision type
+ * to preserve numerical stability.
  * @note This function requires double precision
  * @param likelihood The particles likelihood
  * @param weights The particles weights
  * @param sum The reference to sum on global mem
  * @param nParticles The number of particles
-*/
+ */
 template <typename T>
-__global__ void weightingKernel(T *likelihood, T *weights, T *cdf, double *sum, int nParticles)
+__global__ void weightingKernel(T *likelihood, T *weights, T *cdf, double *sum, int nParticles, T *maxLikelihood)
 {
-    int globalIdx = blockIdx.x * blockDim.x + threadIdx.x; 
-    int localIdx = threadIdx.x; 
-    double unnormalized; 
+    int globalIdx = blockIdx.x * blockDim.x + threadIdx.x;
+    int localIdx = threadIdx.x;
+    double unnormalized;
 
-    extern __shared__ double buffer[]; 
+    SharedMemory<double> sharedMem;
+    double* buffer = sharedMem.getPointer();  
 
-    if (globalIdx < nParticles) {
-        unnormalized = (double)weights[globalIdx] * exp((double)likelihood[globalIdx] + 100);
-        buffer[localIdx] = unnormalized; 
+    if (globalIdx < nParticles)
+    {
+        unnormalized = (double)weights[globalIdx] * exp((double)likelihood[globalIdx] - (double)(maxLikelihood[0]));
+        buffer[localIdx] = unnormalized;
     }
 
-    __syncthreads(); 
+    __syncthreads();
 
-    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1)
+    {
         if (threadIdx.x < s)
-            buffer[localIdx] += buffer[localIdx + s]; 
+            buffer[localIdx] += buffer[localIdx + s];
         __syncthreads();
     }
 
-    if (globalIdx == 0) {
-        *sum = 0; 
+    if (globalIdx == 0)
+    {
+        *sum = 0;
     }
 
-    __syncthreads(); 
+    __syncthreads();
 
-    if (localIdx == 0) {
-        atomicAdd(sum, buffer[0]); 
+    if (localIdx == 0)
+    {
+        atomicAdd(sum, buffer[0]);
     }
 
-    __syncthreads(); 
+    __syncthreads();
 
-    weights[globalIdx] = (T)(unnormalized / (*sum)); 
+    weights[globalIdx] = (T)(unnormalized / (*sum));
 
-    if (globalIdx == 0) {
-        int x; 
-        cdf[0] = weights[0]; 
-        for (x = 1; x < nParticles; x++) {
-            cdf[x] = weights[x] + cdf[x - 1]; 
+    if (globalIdx == 0)
+    {
+        int x;
+        cdf[0] = weights[0];
+        for (x = 1; x < nParticles; x++)
+        {
+            cdf[x] = weights[x] + cdf[x - 1];
         }
     }
-    
-    __syncthreads(); 
+
+    __syncthreads();
 }
 
 /**
- * Resamples particles from a set of selected 
- * ancestors using a systematic resmapling scheme. 
+ * Resamples particles from a set of selected
+ * ancestors using a systematic resmapling scheme.
  * @param states cuRAND states for each threads
  * @param X The X coordinate of current particles
  * @param Y The Y coordinate of current particles
@@ -564,60 +682,62 @@ __global__ void weightingKernel(T *likelihood, T *weights, T *cdf, double *sum, 
  * @param cdf The CDF of normalized weights to resample from
  * @param u The uniform random variable needed for resampling
  * @param nParticles The number of particles in the simulation
-*/
+ */
 template <typename T>
-__global__ void resamplingKernel(curandState *states, T *X, T *Y, T *Ax, T *Ay, T *weights, T *cdf, T *u, int nParticles) 
+__global__ void resamplingKernel(curandState *states, T *X, T *Y, T *Ax, T *Ay, T *weights, T *cdf, T *u, int nParticles)
 {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x; 
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    T multiplier = cdf[nParticles - 1];
 
-    if (idx == 0) {
-        curandState localState = states[idx]; 
-        u[0] = (T)curand_uniform(&localState) / (T)nParticles; 
-        states[idx] = localState; 
+    if (idx == 0)
+    {
+        curandState localState = states[idx];
+        u[0] = (T)curand_uniform(&localState) * multiplier / (T)nParticles;
+        states[idx] = localState;
     }
 
-    __syncthreads(); 
+    __syncthreads();
 
-    if (idx != 0 && idx < nParticles) 
+    if (idx != 0 && idx < nParticles)
     {
-        u[idx] = u[0] + (T)idx / (T)nParticles;
+        u[idx] = u[0] + (T)idx * multiplier / (T)nParticles;
     }
 
     if (idx < nParticles)
     {
-        int ancestor = -1; 
-        int x; 
+        int ancestor = -1;
+        int x;
 
-        for (x = 0; x < nParticles; x++) {
-            if (cdf[x] >= u[idx]) {
-                ancestor = x; 
-                break; 
+        for (x = 0; x < nParticles; x++)
+        {
+            if (cdf[x] >= u[idx])
+            {
+                ancestor = x;
+                break;
             }
         }
 
-        if (ancestor == -1) {
-            ancestor = nParticles - 1; 
+        if (ancestor == -1)
+        {
+            ancestor = nParticles - 1;
         }
 
-        Ax[idx] = X[ancestor]; 
-        Ay[idx] = Y[ancestor]; 
-        weights[idx] = (T)1 / (T)nParticles; 
+        Ax[idx] = X[ancestor];
+        Ay[idx] = Y[ancestor];
+        weights[idx] = (T)1 / (T)nParticles;
     }
 }
 
 /**
- * Calculate the kernel launch congiguration
- * based on the data type. Call numBlocksHalf 
- * when you would like to half the number of blocks 
- * if possible (e.g. when T is half-precision type)
- * @param n the number of total threads
+ * Calculate the kernel launch config for LL Kernel
+ * based on the data type. When using half-precision
+ * the number of threads can be reduced by half.
  * @param tpb the number of threads per block
-*/
-inline int numBlocksFull(int n, int tpb) { return (n - 1) / tpb + 1; }
-template <typename T> 
-inline int numBlocksHalf(int n, int tpb) { return (n - 1) / tpb + 1; }
-template <> 
-inline int numBlocksHalf<half>(int n, int tpb) { return (0.5 * n - 1) / tpb + 1; }
+ */
+template <typename T>
+inline int LLNumBlocks(int n, int m, int tpb) { return (n * m - 1) / tpb + 1; }
+template <>
+inline int LLNumBlocks<half>(int n, int m, int tpb) { return (n * m / 2 - 1) / tpb + 1; }
 
 /**
  * The implementation of the particle filter using OpenMP for many frames
@@ -634,8 +754,8 @@ template <typename T>
 void particleFilter(unsigned char *I, int IszX, int IszY, int Nfr, int seed, int nParticles)
 {
     curandState *states;
-    int threadsPerBlocks = 128;
-    int numBlocks = numBlocksFull(nParticles, threadsPerBlocks);
+    int threadsPerBlocks = 256;
+    int numBlocks = (nParticles - 1) / threadsPerBlocks + 1;
     int totalThreads = numBlocks * threadsPerBlocks;
 
     /**
@@ -694,6 +814,7 @@ void particleFilter(unsigned char *I, int IszX, int IszY, int Nfr, int seed, int
 
     T *deviceAx, *deviceAy, *deviceX, *deviceY, *deviceU;
     T *deviceLikelihood, *deviceCdf, *deviceWeights;
+    T *deviceMaxLikelihood;
     double *deviceSum;
 
     int *deviceObjXy;
@@ -723,6 +844,7 @@ void particleFilter(unsigned char *I, int IszX, int IszY, int Nfr, int seed, int
     cudaCheck(cudaMalloc(&deviceU, nParticles * sizeof(T)));
 
     cudaCheck(cudaMalloc(&deviceSum, sizeof(double)));
+    cudaCheck(cudaMalloc(&deviceMaxLikelihood, numBlocks * sizeof(T)));
     cudaCheck(cudaMalloc(&deviceCdf, nParticles * sizeof(T)));
     cudaCheck(cudaMalloc(&deviceWeights, nParticles * sizeof(T)));
     cudaCheck(cudaMalloc(&deviceObjXy, 2 * countOnes * sizeof(int)));
@@ -743,24 +865,40 @@ void particleFilter(unsigned char *I, int IszX, int IszY, int Nfr, int seed, int
     cudaCheck(cudaMemcpy(deviceWeights, weights, nParticles * sizeof(T), cudaMemcpyHostToDevice));
     cudaCheck(cudaMemcpy(deviceAx, Ax, nParticles * sizeof(T), cudaMemcpyHostToDevice));
     cudaCheck(cudaMemcpy(deviceAy, Ay, nParticles * sizeof(T), cudaMemcpyHostToDevice));
-    cudaCheck(cudaDeviceSynchronize()); 
+    cudaCheck(cudaDeviceSynchronize());
     long long sendEnd = get_time();
 
     curandSetupKernel<<<numBlocks, threadsPerBlocks>>>(states, totalThreads, seed);
 
 #ifdef TRACE
-    FILE *fp = fopen("mixed_precision_trace.txt", "w"); 
-    FILE *pfp = fopen("movement_hat.txt", "w"); 
+    FILE *fp = fopen("mixed_precision_trace.txt", "w");
+    FILE *pfp = fopen("movement_hat.txt", "w");
     fprintf(pfp, "PREDICTED MOVEMENT:\n");
 #endif
 
-    long long kernelStart = get_time(); 
-    int sharedMemSize = threadsPerBlocks * sizeof(double); 
-    for (r = 1; r < Nfr; r++)
+    long long kernelStart = get_time();
+    int sharedMemSize = threadsPerBlocks * sizeof(double);
+    for (r = 0; r < Nfr; r++)
     {
-        propagationKernel<<<numBlocks, threadsPerBlocks>>>(states, deviceX, deviceY, deviceAx, deviceAy, nParticles);
-        likelihoodKernel<<<numBlocks, threadsPerBlocks>>>(deviceX, deviceY, nParticles, deviceObjXy, countOnes, deviceLikelihood, deviceI, IszY, Nfr, maxSize, r);
-        weightingKernel<<<numBlocks, threadsPerBlocks, sharedMemSize>>>(deviceLikelihood, deviceWeights, deviceCdf, deviceSum, nParticles);
+        propagationKernel<<<numBlocks, threadsPerBlocks>>>(states,
+                                                           deviceX, deviceY,
+                                                           deviceAx, deviceAy,
+                                                           nParticles);
+
+        int numBlocksTemp = LLNumBlocks<T>(nParticles, countOnes, threadsPerBlocks);
+        likelihoodKernel<<<numBlocksTemp, threadsPerBlocks>>>(deviceX, deviceY,
+                                                              nParticles, deviceObjXy, countOnes,
+                                                              deviceLikelihood, deviceI,
+                                                              IszY, Nfr, maxSize, r);
+
+        findMaxKernel<<<numBlocks, threadsPerBlocks, threadsPerBlocks * sizeof(double)>>>(deviceLikelihood,
+                                                                                          deviceMaxLikelihood, nParticles); 
+
+        weightingKernel<<<numBlocks, threadsPerBlocks, sharedMemSize>>>(deviceLikelihood,
+                                                                        deviceWeights, deviceCdf,
+                                                                        deviceSum, nParticles, 
+                                                                        deviceMaxLikelihood);
+
 #ifdef TRACE
         cudaCheck(cudaMemcpy(likelihood, deviceLikelihood, nParticles * sizeof(T), cudaMemcpyDeviceToHost));
         cudaCheck(cudaMemcpy(weights, deviceWeights, nParticles * sizeof(T), cudaMemcpyDeviceToHost));
@@ -775,28 +913,34 @@ void particleFilter(unsigned char *I, int IszX, int IszY, int Nfr, int seed, int
         for (int k = 0; k < nParticles; k++)
         {
             fprintf(fp, "<%5.2f, %5.2f> || <%5.2f, %5.2f> ~ %10.4f ~ %10.4f ^+ %10.4f ~ %10.4f \n",
-                    (double)Ax[k], (double)Ay[k], (double) X[k], (double)Y[k], 
-                    (double)likelihood[k], (double)weights[k], 
+                    (double)Ax[k], (double)Ay[k], (double)X[k], (double)Y[k],
+                    (double)likelihood[k], (double)weights[k],
                     (double)cdf[k], (double)U[k]);
         }
 
-        double xHat = 0.0; 
-        double yHat = 0.0; 
+        double xHat = 0.0;
+        double yHat = 0.0;
 
-        for (int k = 0; k < nParticles; k++) {
+        for (int k = 0; k < nParticles; k++)
+        {
             xHat += (double)weights[k] * (double)X[k];
             yHat += (double)weights[k] * (double)Y[k];
         }
 
-        fprintf(fp, "END FRAME %d ~ Predicted Position = <%f,%f>\n", 
+        fprintf(fp, "END FRAME %d ~ Predicted Position = <%f,%f>\n",
                 r, xHat, yHat);
         fprintf(pfp, ". <%.2f, %.2f>\n", xHat, yHat);
 #endif
-        resamplingKernel<<<numBlocks, threadsPerBlocks>>>(states, deviceX, deviceY, deviceAx, deviceAy, deviceWeights, deviceCdf, deviceU, nParticles);
+
+        resamplingKernel<<<numBlocks, threadsPerBlocks>>>(states,
+                                                          deviceX, deviceY,
+                                                          deviceAx, deviceAy,
+                                                          deviceWeights, deviceCdf,
+                                                          deviceU, nParticles);
     }
 
 #ifdef TRACE
-    fprintf(pfp, "end"); 
+    fprintf(pfp, "end");
     fclose(fp);
     fclose(pfp);
 #endif
@@ -828,18 +972,19 @@ void particleFilter(unsigned char *I, int IszX, int IszY, int Nfr, int seed, int
     cudaCheck(cudaFree(deviceSum));
     cudaCheck(cudaFree(deviceI));
     cudaCheck(cudaFree(deviceLikelihood));
+    cudaCheck(cudaFree(deviceMaxLikelihood));
     cudaCheck(cudaFree(states));
 
-    free(disk); 
-    free(objxy); 
-    free(X); 
-    free(Y); 
-    free(Ax); 
-    free(Ay); 
+    free(disk);
+    free(objxy);
+    free(X);
+    free(Y);
+    free(Ax);
+    free(Ay);
     free(U);
     free(cdf);
-    free(weights); 
-    free(likelihood); 
+    free(weights);
+    free(likelihood);
 
     cudaCheck(cudaDeviceSynchronize());
 }
@@ -847,21 +992,21 @@ void particleFilter(unsigned char *I, int IszX, int IszY, int Nfr, int seed, int
 int main(int argc, char *argv[])
 {
 
-    const char *usage = "double.out -x <dimX> -y <dimY> -z <Nfr> -np <nParticles> -pcs <double|float|half>";
+    const char *usage = "double.out -x <dimX> -y <dimY> -z <Nfr> -np <nParticles> -pcs <double|float|half> -seed <seed>";
     // check number of arguments
-    if (argc != 11)
+    if (argc != 13)
     {
         printf("%s\n", usage);
         return 0;
     }
     // check args deliminators
-    if (strcmp(argv[1], "-x") || strcmp(argv[3], "-y") || strcmp(argv[5], "-z") || strcmp(argv[7], "-np") || strcmp(argv[9], "-pcs"))
+    if (strcmp(argv[1], "-x") || strcmp(argv[3], "-y") || strcmp(argv[5], "-z") || strcmp(argv[7], "-np") || strcmp(argv[9], "-pcs") || strcmp(argv[11], "-seed"))
     {
         printf("%s\n", usage);
         return 0;
     }
 
-    int IszX, IszY, Nfr, nParticles, pcs;
+    int IszX, IszY, Nfr, nParticles, pcs, deviceSeed;
 
     // converting a string to a integer
     if (sscanf(argv[2], "%d", &IszX) == EOF)
@@ -915,13 +1060,26 @@ int main(int argc, char *argv[])
         return 0;
     }
 
-    if (!strcmp(argv[10], "half")) {
-        pcs = 0; 
-    } else if (!strcmp(argv[10], "float")) {
-        pcs = 1; 
-    } else if (!strcmp(argv[10], "double")) {
-        pcs = 2; 
-    } else {
+    if (sscanf(argv[12], "%d", &deviceSeed) == EOF)
+    {
+        printf("ERROR: Seed is invalid");
+        return 0;
+    }
+
+    if (!strcmp(argv[10], "half"))
+    {
+        pcs = 0;
+    }
+    else if (!strcmp(argv[10], "float"))
+    {
+        pcs = 1;
+    }
+    else if (!strcmp(argv[10], "double"))
+    {
+        pcs = 2;
+    }
+    else
+    {
         printf("%s\n", usage);
         return 0;
     }
@@ -933,26 +1091,23 @@ int main(int argc, char *argv[])
         seed[i] = time(0) * i;
     // malloc matrix
     unsigned char *I = (unsigned char *)malloc(sizeof(unsigned char) * IszX * IszY * Nfr);
+
     long long start = get_time();
-    // call video sequence
     videoSequence(I, IszX, IszY, Nfr, seed);
     long long endVideoSequence = get_time();
     printf("VIDEO SEQUENCE TOOK %f\n", elapsed_time(start, endVideoSequence));
-    // call particle filter 20 times
-    // with different seeds
 
-    for (int s = 0; s < 20; s++) {
-        switch (pcs) {
-            case 0: 
-                particleFilter<half>(I, IszX, IszY, Nfr, s * 2, nParticles);
-                break; 
-            case 1:
-                particleFilter<float>(I, IszX, IszY, Nfr, s * 2, nParticles);
-                break; 
-            case 2: 
-                particleFilter<double>(I, IszX, IszY, Nfr, s * 2, nParticles);
-                break; 
-        }
+    switch (pcs)
+    {
+    case 0:
+        particleFilter<half>(I, IszX, IszY, Nfr, deviceSeed, nParticles);
+        break;
+    case 1:
+        particleFilter<float>(I, IszX, IszY, Nfr, deviceSeed, nParticles);
+        break;
+    case 2:
+        particleFilter<double>(I, IszX, IszY, Nfr, deviceSeed, nParticles);
+        break;
     }
 
     long long endParticleFilter = get_time();
