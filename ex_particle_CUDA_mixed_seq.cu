@@ -804,6 +804,86 @@ __global__ void resamplingKernel(curandState *states, T *X, T *Y, T *Ax, T *Ay, 
     }
 }
 
+template <>
+__global__ void resamplingKernel(curandState *states, half *X, half *Y, half *Ax, half *Ay, half *weights, half *cdf, half *u, int nParticles)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int nParticles2 = nParticles / 2; 
+
+    half m = cdf[nParticles - 1];
+    half n = __int2half_rn(nParticles); 
+    half q = m / n; 
+
+    half2 m2 = __half2half2(m);
+    half2 n2 = __half2half2(n);
+    half2 q2 = m2 / n2; 
+
+    half2 *weights2 = (half2 *)weights; 
+    half2 *u2 = (half2 *)u;
+
+    if (idx == 0)
+    {
+        curandState localState = states[idx];
+        half urv = __double2half(curand_uniform(&localState)) * q;
+        u2[0] = __halves2half2(urv, urv + q); 
+        states[idx] = localState;
+    }
+
+    __syncthreads();
+
+    if (idx != 0 && idx < nParticles2)
+    {
+        half2 temp = __halves2half2(2 * idx, 2 * idx + 1); 
+        u2[idx] = __low2half2(u2[0]) + temp * q2;
+    }
+
+    if (idx < nParticles2) {
+        weights2[idx] = h2rcp(n2);
+    }
+
+    __syncthreads(); 
+
+
+    if (idx < nParticles2)
+    {
+        half2 res, unmoved, urv2 = u2[idx];
+        bool allmoved;  
+        int ancestorA = -1;
+        int ancestorB = -1; 
+        int x;
+
+        for (x = 0; x < nParticles; x++)
+        {
+            res = __hge2(__half2half2(cdf[x]), urv2); 
+            unmoved = __heq2(__half2half2(-1), __floats2half2_rn(ancestorA, ancestorB)); 
+            allmoved = __hbne2(__half2half2(-1), __floats2half2_rn(ancestorA, ancestorB)); 
+            
+            if (__low2half(unmoved) && __low2half(res)) {
+                ancestorA = x; 
+            }
+
+            if (__high2half(unmoved) && __high2half(res)) {
+                ancestorB = x; 
+            }
+
+            if (allmoved) {
+                break; 
+            }
+        }
+
+        if (ancestorA == -1)
+            ancestorA = nParticles - 1;
+
+        if (ancestorB == -1)
+            ancestorB = nParticles - 1; 
+
+        Ax[idx] = X[ancestorA];
+        Ay[idx] = Y[ancestorA];
+        Ax[idx + 1] = X[ancestorB];
+        Ay[idx + 1] = Y[ancestorB];
+    }
+}
+
 /**
  * Calculate the kernel launch config for LL Kernel
  * based on the data type. When using half-precision
@@ -1014,11 +1094,12 @@ void particleFilter(unsigned char *I, int IszX, int IszY, int Nfr, int seed, int
         fprintf(pfp, ". <%.2f, %.2f>\n", xHat, yHat);
 #endif
 
-        resamplingKernel<<<numBlocks, threadsPerBlocks>>>(states,
-                                                          deviceX, deviceY,
-                                                          deviceAx, deviceAy,
-                                                          deviceWeights, deviceCdf,
-                                                          deviceU, nParticles);
+        int resamplingBlocks = calcNumBlocks<T>(nParticles, 1, threadsPerBlocks);
+        resamplingKernel<<<resamplingBlocks, threadsPerBlocks>>>(states,
+                                                                 deviceX, deviceY,
+                                                                 deviceAx, deviceAy,
+                                                                 deviceWeights, deviceCdf,
+                                                                 deviceU, nParticles);
     }
 
 #ifdef TRACE
