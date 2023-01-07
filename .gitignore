@@ -3,3 +3,4 @@ movement*.txt
 *trace.txt
 *.csv
 benchmark/
+*_path.txt
