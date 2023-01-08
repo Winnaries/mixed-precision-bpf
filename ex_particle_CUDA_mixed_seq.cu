@@ -313,7 +313,6 @@ void videoSequence(unsigned char *I, int IszX, int IszY, int Nfr, int *seed)
     I[x0 * IszY * Nfr + y0 * Nfr + 0] = 1;
 
     FILE *fp = fopen("movement_true.txt", "w");
-    fprintf(fp, "TRUE MOVEMENT: \n");
 
     /*move point*/
     int xk, yk, pos;
@@ -321,14 +320,13 @@ void videoSequence(unsigned char *I, int IszX, int IszY, int Nfr, int *seed)
     {
         xk = abs(x0 + (k - 1));
         yk = abs(y0 - 2 * (k - 1));
-        fprintf(fp, ". <%d, %d>\n", xk, yk);
+        fprintf(fp, "%d, %d\n", xk, yk);
         pos = yk * IszY * Nfr + xk * Nfr + k;
         if (pos >= max_size)
             pos = 0;
         I[pos] = 1;
     }
 
-    fprintf(fp, "end\n");
 
     /*dilate matrix*/
     unsigned char *newMatrix = (unsigned char *)malloc(sizeof(unsigned char) * IszX * IszY * Nfr);
@@ -578,7 +576,7 @@ __global__ void findMaxKernel(T *array, T *result, int n)
     }
     else
     {
-        fmbuffer[localIdx] = -100;
+        fmbuffer[localIdx] = -10000;
     }
 
     __syncthreads();
@@ -601,14 +599,18 @@ __global__ void findMaxKernel(T *array, T *result, int n)
     }
 
     __syncthreads();
+}
 
-    if (globalIdx == 0)
+template <typename T>
+__global__ void findMaxOverBlocks(T *result, int numBlocks)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (idx == 0)
     {
-        for (int i = 1; i < gridDim.x; i++)
+        for (int i = 1; i < numBlocks; i++)
             result[0] = result[0] > result[i] ? result[0] : result[i];
     }
-
-    __syncthreads();
 }
 
 /**
@@ -635,7 +637,7 @@ __global__ void weightingKernel(T *likelihood, T *weights, T *cdf, T *sum, int n
     {
         unnormalized = weights[globalIdx] * exp(likelihood[globalIdx] - maxLikelihood[0]);
         buffer[localIdx] = unnormalized;
-        weights[globalIdx] = unnormalized; 
+        weights[globalIdx] = unnormalized;
     }
     else
     {
@@ -670,13 +672,13 @@ __global__ void weightingKernel(half *likelihood, half *weights, half *cdf, half
     half2 maxLikelihood2 = __half2half2(maxLikelihood[0]);
 
     extern __shared__ half buffer[];
-    half2 *buffer2 = (half2 *)buffer; 
+    half2 *buffer2 = (half2 *)buffer;
 
     if (globalIdx < nParticles2)
     {
         unnormalized2 = weights2[globalIdx] * h2exp(__hsub2(likelihood2[globalIdx], maxLikelihood2));
         buffer2[localIdx] = unnormalized2;
-        weights2[globalIdx] = unnormalized2; 
+        weights2[globalIdx] = unnormalized2;
     }
     else
     {
@@ -698,19 +700,18 @@ __global__ void weightingKernel(half *likelihood, half *weights, half *cdf, half
     }
 }
 
-
 /**
  * Normalize particle weights given a sum
- * and calculate the cdf array for later uses. 
+ * and calculate the cdf array for later uses.
  * @param weights
  * @param cdf
  * @param sum
  * @param nParticles
-*/
+ */
 template <typename T>
 __global__ void normalizingKernel(T *weights, T *cdf, T *sum, int nParticles)
 {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x; 
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
     if (idx < nParticles)
     {
@@ -731,11 +732,11 @@ __global__ void normalizingKernel(T *weights, T *cdf, T *sum, int nParticles)
 template <>
 __global__ void normalizingKernel(half *weights, half *cdf, half *sum, int nParticles)
 {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x; 
-    int nParticles2 = nParticles / 2; 
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int nParticles2 = nParticles / 2;
 
-    half2 *weights2 = (half2 *)weights; 
-    half2 *cdf2 = (half2 *)cdf; 
+    half2 *weights2 = (half2 *)weights;
+    half2 *cdf2 = (half2 *)cdf;
 
     if (idx < nParticles2)
     {
@@ -754,7 +755,6 @@ __global__ void normalizingKernel(half *weights, half *cdf, half *sum, int nPart
         }
     }
 }
-
 
 /**
  * Resamples particles from a set of selected
@@ -817,24 +817,24 @@ template <>
 __global__ void resamplingKernel(curandState *states, half *X, half *Y, half *Ax, half *Ay, half *weights, half *cdf, half *u, int nParticles)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int nParticles2 = nParticles / 2; 
+    int nParticles2 = nParticles / 2;
 
     half m = cdf[nParticles - 1];
-    half n = __int2half_rn(nParticles); 
-    half q = m / n; 
+    half n = __int2half_rn(nParticles);
+    half q = m / n;
 
     half2 m2 = __half2half2(m);
     half2 n2 = __half2half2(n);
-    half2 q2 = m2 / n2; 
+    half2 q2 = m2 / n2;
 
-    half2 *weights2 = (half2 *)weights; 
+    half2 *weights2 = (half2 *)weights;
     half2 *u2 = (half2 *)u;
 
     if (idx == 0)
     {
         curandState localState = states[idx];
         half urv = __double2half(curand_uniform(&localState)) * q;
-        u2[0] = __halves2half2(urv, urv + q); 
+        u2[0] = __halves2half2(urv, urv + q);
         states[idx] = localState;
     }
 
@@ -842,41 +842,44 @@ __global__ void resamplingKernel(curandState *states, half *X, half *Y, half *Ax
 
     if (idx != 0 && idx < nParticles2)
     {
-        half2 temp = __halves2half2(2 * idx, 2 * idx + 1); 
+        half2 temp = __halves2half2(2 * idx, 2 * idx + 1);
         u2[idx] = __low2half2(u2[0]) + temp * q2;
     }
 
-    if (idx < nParticles2) {
+    if (idx < nParticles2)
+    {
         weights2[idx] = h2rcp(n2);
     }
 
-    __syncthreads(); 
-
+    __syncthreads();
 
     if (idx < nParticles2)
     {
         half2 res, unmoved, urv2 = u2[idx];
-        bool allmoved;  
+        bool allmoved;
         int ancestorA = -1;
-        int ancestorB = -1; 
+        int ancestorB = -1;
         int x;
 
         for (x = 0; x < nParticles; x++)
         {
-            res = __hge2(__half2half2(cdf[x]), urv2); 
-            unmoved = __heq2(__half2half2(-1), __floats2half2_rn(ancestorA, ancestorB)); 
-            allmoved = __hbne2(__half2half2(-1), __floats2half2_rn(ancestorA, ancestorB)); 
-            
-            if (__low2half(unmoved) && __low2half(res)) {
-                ancestorA = x; 
+            res = __hge2(__half2half2(cdf[x]), urv2);
+            unmoved = __heq2(__half2half2(-1), __floats2half2_rn(ancestorA, ancestorB));
+            allmoved = __hbne2(__half2half2(-1), __floats2half2_rn(ancestorA, ancestorB));
+
+            if (__low2half(unmoved) && __low2half(res))
+            {
+                ancestorA = x;
             }
 
-            if (__high2half(unmoved) && __high2half(res)) {
-                ancestorB = x; 
+            if (__high2half(unmoved) && __high2half(res))
+            {
+                ancestorB = x;
             }
 
-            if (allmoved) {
-                break; 
+            if (allmoved)
+            {
+                break;
             }
         }
 
@@ -884,12 +887,12 @@ __global__ void resamplingKernel(curandState *states, half *X, half *Y, half *Ax
             ancestorA = nParticles - 1;
 
         if (ancestorB == -1)
-            ancestorB = nParticles - 1; 
+            ancestorB = nParticles - 1;
 
-        Ax[idx] = X[ancestorA];
-        Ay[idx] = Y[ancestorA];
-        Ax[idx + 1] = X[ancestorB];
-        Ay[idx + 1] = Y[ancestorB];
+        Ax[2 * idx] = X[ancestorA];
+        Ay[2 * idx] = Y[ancestorA];
+        Ax[2 * idx + 1] = X[ancestorB];
+        Ay[2 * idx + 1] = Y[ancestorB];
     }
 }
 
@@ -1045,7 +1048,7 @@ void particleFilter(unsigned char *I, int IszX, int IszY, int Nfr, int seed, int
 #ifdef TRACE
     FILE *fp = fopen("mixed_precision_trace.txt", "w");
     FILE *pfp = fopen("movement_hat.txt", "w");
-    fprintf(pfp, "PREDICTED MOVEMENT:\n");
+    // fprintf(pfp, "[\n");
 #endif
 
     long long kernelStart = get_time();
@@ -1065,8 +1068,9 @@ void particleFilter(unsigned char *I, int IszX, int IszY, int Nfr, int seed, int
         int findMaxSharedMem = threadsPerBlocks * sizeof(double);
         findMaxKernel<<<numBlocks, threadsPerBlocks, findMaxSharedMem>>>(deviceLikelihood,
                                                                          deviceMaxLikelihood, nParticles);
+        findMaxOverBlocks<<<1, numBlocks>>>(deviceMaxLikelihood, numBlocks);
 
-        cudaMemset(deviceSum, 0, sizeof(T)); 
+        cudaMemset(deviceSum, 0, sizeof(T));
         int weightingBlocks = calcNumBlocks<T>(nParticles, 1, threadsPerBlocks);
         int weightingSharedMem = calcSharedMem<T>(threadsPerBlocks);
         weightingKernel<<<weightingBlocks, threadsPerBlocks, weightingSharedMem>>>(deviceLikelihood,
@@ -1074,8 +1078,8 @@ void particleFilter(unsigned char *I, int IszX, int IszY, int Nfr, int seed, int
                                                                                    deviceSum, nParticles,
                                                                                    deviceMaxLikelihood);
 
-        int normalizingBlocks = calcNumBlocks<T>(nParticles, 1, threadsPerBlocks); 
-        normalizingKernel<<<weightingBlocks, threadsPerBlocks>>>(deviceWeights, deviceCdf, deviceSum, nParticles); 
+        int normalizingBlocks = calcNumBlocks<T>(nParticles, 1, threadsPerBlocks);
+        normalizingKernel<<<weightingBlocks, threadsPerBlocks>>>(deviceWeights, deviceCdf, deviceSum, nParticles);
 
 #ifdef TRACE
         cudaCheck(cudaMemcpy(likelihood, deviceLikelihood, nParticles * sizeof(T), cudaMemcpyDeviceToHost));
@@ -1107,7 +1111,7 @@ void particleFilter(unsigned char *I, int IszX, int IszY, int Nfr, int seed, int
 
         fprintf(fp, "END FRAME %d ~ Predicted Position = <%f,%f>\n",
                 r, xHat, yHat);
-        fprintf(pfp, ". <%.2f, %.2f>\n", xHat, yHat);
+        fprintf(pfp, "%10f, %10f\n", xHat, yHat);
 #endif
 
         int resamplingBlocks = calcNumBlocks<T>(nParticles, 1, threadsPerBlocks);
@@ -1119,15 +1123,15 @@ void particleFilter(unsigned char *I, int IszX, int IszY, int Nfr, int seed, int
     }
 
 #ifdef TRACE
-    fprintf(pfp, "end");
+    // fprintf(pfp, "]");
     fclose(fp);
     fclose(pfp);
 #endif
 
     cudaCheck(cudaDeviceSynchronize());
 
-    long long pfEnd = get_time(); 
-    printf("GPU Execution: %f\n", elapsed_time(pfStart, pfEnd)); 
+    long long pfEnd = get_time();
+    printf("GPU Execution: %f\n", elapsed_time(pfStart, pfEnd));
 
     long long kernelEnd = get_time();
     cudaCheck(cudaMemcpy(likelihood, deviceLikelihood, nParticles * sizeof(T), cudaMemcpyDeviceToHost));
@@ -1169,7 +1173,6 @@ void particleFilter(unsigned char *I, int IszX, int IszY, int Nfr, int seed, int
     free(likelihood);
 
     cudaCheck(cudaDeviceSynchronize());
-
 }
 
 int main(int argc, char *argv[])
@@ -1271,7 +1274,7 @@ int main(int argc, char *argv[])
     int *seed = (int *)malloc(sizeof(int) * nParticles);
     int i;
     for (i = 0; i < nParticles; i++)
-        seed[i] = time(0) * i;
+        seed[i] = 1111 * i;
     // malloc matrix
     unsigned char *I = (unsigned char *)malloc(sizeof(unsigned char) * IszX * IszY * Nfr);
 
