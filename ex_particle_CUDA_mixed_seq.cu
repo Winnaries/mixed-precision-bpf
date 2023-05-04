@@ -848,39 +848,31 @@ __global__ void resamplingKernel(curandState *states, half *X, half *Y, half *Ax
 
     if (idx < nParticles2)
     {
-        weights2[idx] = h2rcp(n2);
-    }
-
-    __syncthreads();
-
-    if (idx < nParticles2)
-    {
-        half2 res, unmoved, urv2 = u2[idx];
-        bool allmoved;
+        half2 urv2 = u2[idx];
         int ancestorA = -1;
         int ancestorB = -1;
-        int x;
+
+        int x; 
+        half2 temp, curr;  
+        half2 prev = __float2half2_rn(0.00);
+        half2 exit = __float2half2_rn(1.00); 
 
         for (x = 0; x < nParticles; x++)
         {
-            res = __hge2(__half2half2(cdf[x]), urv2);
-            unmoved = __heq2(__half2half2(-1), __floats2half2_rn(ancestorA, ancestorB));
-            allmoved = __hbne2(__half2half2(-1), __floats2half2_rn(ancestorA, ancestorB));
+            curr = __hge2(__half2half2(cdf[x]), urv2);
+            temp = __hne2(prev, curr); 
 
-            if (__low2half(unmoved) && __low2half(res))
+            if (__low2float(temp))
             {
                 ancestorA = x;
             }
 
-            if (__high2half(unmoved) && __high2half(res))
+            if (__high2float(temp))
             {
                 ancestorB = x;
             }
 
-            if (allmoved)
-            {
-                break;
-            }
+            prev = curr; 
         }
 
         if (ancestorA == -1)
@@ -893,6 +885,7 @@ __global__ void resamplingKernel(curandState *states, half *X, half *Y, half *Ax
         Ay[2 * idx] = Y[ancestorA];
         Ax[2 * idx + 1] = X[ancestorB];
         Ay[2 * idx + 1] = Y[ancestorB];
+        weights2[idx] = h2rcp(n2);
     }
 }
 
